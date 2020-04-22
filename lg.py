@@ -76,7 +76,7 @@ def add_links(text):
             ret_text.append(re.sub(r'(\d+)', r'<a href="/whois?q=\1" class="whois">\1</a>', line))
         else:
             line = re.sub(r'([a-zA-Z0-9\-]*\.([a-zA-Z]{2,3}){1,2})(\s|$)', r'<a href="/whois?q=\1" class="whois">\1</a>\3', line)
-            line = re.sub(r'AS(\d+)', r'<a href="/whois?q=\1" class="whois">AS\1</a>', line)
+            line = re.sub(r'(?<=\[)AS(\d+)', r'<a href="/whois?q=\1" class="whois">AS\1</a>', line)
             line = re.sub(r'(\d+\.\d+\.\d+\.\d+)', r'<a href="/whois?q=\1" class="whois">\1</a>', line)
             if len(request.path) >= 2:
                 hosts = "/".join(request.path.split("/")[2:])
@@ -222,9 +222,7 @@ def whois():
     return jsonify(output=output, title=query)
 
 
-SUMMARY_UNWANTED_PROTOS = ["Kernel", "Static", "Device"]
-SUMMARY_RE_MATCH = r"(?P<name>[\w_]+)\s+(?P<proto>\w+)\s+(?P<table>\w+)\s+(?P<state>\w+)\s+(?P<since>((|\d\d\d\d-\d\d-\d\d\s)|(\d\d:)\d\d:\d\d|\w\w\w\d\d))($|\s+(?P<info>.*))"
-
+SUMMARY_UNWANTED_PROTOS = ["Kernel", "Static", "Device", "Direct"]
 
 @app.route("/summary/<hosts>")
 @app.route("/summary/<hosts>/<proto>")
@@ -251,9 +249,16 @@ def summary(hosts, proto="ipv4"):
         for line in res[1:]:
             line = line.strip()
             if line and (line.split() + [""])[1] not in SUMMARY_UNWANTED_PROTOS:
-                m = re.match(SUMMARY_RE_MATCH, line)
-                if m:
-                    data.append(m.groupdict())
+                split = line.split()
+                if len(split) >= 5:
+                    props = dict()
+                    props["name"] = split[0]
+                    props["proto"] = split[1]
+                    props["table"] = split[2]
+                    props["state"] = split[3]
+                    props["since"] = split[4]
+                    props["info"] = ' '.join(split[5:]) if len(split) > 5 else ""
+                    data.append(props)
                 else:
                     app.logger.warning("couldn't parse: %s", line)
 
@@ -472,7 +477,13 @@ def show_bgpmap():
             hop_label = ""
             for _as in asmap:
                 if _as == previous_as:
-                    prepend_as[_as] = prepend_as.get(_as, 1) + 1
+                    if not prepend_as.get(_as, None):
+                        prepend_as[_as] = {}
+                    if not prepend_as[_as].get(host, None):
+                        prepend_as[_as][host] = {}
+                    if not prepend_as[_as][host].get(asmap[0], None):
+                        prepend_as[_as][host][asmap[0]] = 1
+                    prepend_as[_as][host][asmap[0]] += 1
                     continue
 
                 if not hop:
@@ -486,7 +497,10 @@ def show_bgpmap():
                         hop_label = ""
 
                 
-                add_node(_as, fillcolor=(first and "#F5A9A9" or "white"))
+                if _as == asmap[-1]:
+                    add_node(_as, fillcolor="#F5A9A9", shape="box", )
+                else:
+                    add_node(_as, fillcolor=(first and "#F5A9A9" or "white"), )
                 if hop_label:
                     edge = add_edge(nodes[previous_as], nodes[_as], label=hop_label, fontsize="7")
                 else:
@@ -494,22 +508,19 @@ def show_bgpmap():
 
                 hop_label = ""
 
-                if first:
+                if first or _as == asmap[-1]:
                     edge.set_style("bold")
                     edge.set_color("red")
-                elif edge.get_color() != "red":
+                elif edge.get_style() != "bold":
                     edge.set_style("dashed")
                     edge.set_color(color)
 
                 previous_as = _as
             first = False
 
-    if previous_as:
-        node = add_node(previous_as)
-        node.set_shape("box")
-
     for _as in prepend_as:
-        graph.add_edge(pydot.Edge(*(_as, _as), label=" %dx" % prepend_as[_as], color="grey", fontcolor="grey"))
+        for n in set([ n for h, d in prepend_as[_as].iteritems() for p, n in d.iteritems() ]):
+            graph.add_edge(pydot.Edge(*(_as, _as), label=" %dx" % n, color="grey", fontcolor="grey"))
 
     fmt = request.args.get('fmt', 'png')
     #response = Response("<pre>" + graph.create_dot() + "</pre>")
@@ -533,21 +544,29 @@ def build_as_tree_from_raw_bird_ouput(host, proto, text):
     path = None
     paths = []
     net_dest = None
+    peer_protocol_name = None
     for line in text:
         line = line.strip()
 
-        expr = re.search(r'(.*)via\s+([0-9a-fA-F:\.]+)\s+on.*\[(\w+)\s+', line)
+        expr = re.search(r'(.*)unicast\s+\[(\w+)\s+', line)
         if expr:
+            if expr.group(1).strip():
+                net_dest = expr.group(1).strip()
+            peer_protocol_name = expr.group(2).strip()
+
+        expr2 = re.search(r'(.*)via\s+([0-9a-fA-F:\.]+)\s+on\s+\w+(\s+\[(\w+)\s+)?', line)
+        if expr2:
             if path:
                 path.append(net_dest)
                 paths.append(path)
                 path = None
 
-            if expr.group(1).strip():
-                net_dest = expr.group(1).strip()
+            if expr2.group(1).strip():
+                net_dest = expr2.group(1).strip()
 
-            peer_ip = expr.group(2).strip()
-            peer_protocol_name = expr.group(3).strip()
+            peer_ip = expr2.group(2).strip()
+            if expr2.group(4):
+                peer_protocol_name = expr2.group(4).strip()
             # Check if via line is a internal route
             for rt_host, rt_ips in app.config["ROUTER_IP"].iteritems():
                 # Special case for internal routing
@@ -559,18 +578,25 @@ def build_as_tree_from_raw_bird_ouput(host, proto, text):
                 path = [ peer_protocol_name ]
 #                path = ["%s\r%s" % (peer_protocol_name, get_as_name(get_as_number_from_protocol_name(host, proto, peer_protocol_name)))]
         
-        expr2 = re.search(r'(.*)unreachable\s+\[(\w+)\s+', line)
-        if expr2:
+        expr3 = re.search(r'(.*)unreachable\s+\[(\w+)\s+', line)
+        if expr3:
             if path:
                 path.append(net_dest)
                 paths.append(path)
                 path = None
 
-            if expr2.group(1).strip():
-                net_dest = expr2.group(1).strip()
+            if path is None:
+                path = [ expr3.group(2).strip() ]
+
+            if expr3.group(1).strip():
+                net_dest = expr3.group(1).strip()
 
         if line.startswith("BGP.as_path:"):
-            path.extend(line.replace("BGP.as_path:", "").strip().split(" "))
+            ASes = line.replace("BGP.as_path:", "").strip().split(" ")
+            if path:
+                path.extend(ASes)
+            else:
+                path = ASes
     
     if path:
         path.append(net_dest)
